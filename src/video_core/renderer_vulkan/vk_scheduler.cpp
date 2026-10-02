@@ -84,6 +84,8 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 }
 
 void Scheduler::EndRendering() {
+    // Code outside the rasterizer binds its own pipelines between render passes.
+    bound_graphics_pipeline = vk::Pipeline{};
     if (!is_rendering) {
         return;
     }
@@ -153,6 +155,7 @@ void Scheduler::BeginSession() {
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    bound_graphics_pipeline = vk::Pipeline{};
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();

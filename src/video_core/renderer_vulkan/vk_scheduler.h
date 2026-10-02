@@ -378,6 +378,16 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
+    /// Binds a graphics pipeline, skipping the call when it is already bound in the current
+    /// render pass of the current command buffer.
+    void BindGraphicsPipeline(vk::Pipeline pipeline) {
+        if (pipeline == bound_graphics_pipeline) {
+            return;
+        }
+        bound_graphics_pipeline = pipeline;
+        CommandBuffer().bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+    }
+
     /// Starts a new session.
     void BeginSession();
 
@@ -479,6 +489,7 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    vk::Pipeline bound_graphics_pipeline{};
     tracy::VkCtxScope* profiler_scope{};
 };
 
