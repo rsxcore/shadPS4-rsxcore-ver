@@ -45,7 +45,11 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         copies.emplace_back(local_src_offset, local_dst_offset, local_size);
     }
 
-    static constexpr vk::DeviceSize MaxDistanceForMerge = 64_MB;
+    // Copies are merged into one batch only while they stay close together. The whole span of a
+    // batch is obtained from the buffer cache (and the destination span is marked GPU modified),
+    // so merging far apart copies makes it track and protect megabytes of untouched memory and
+    // later trigger needless readbacks when the CPU writes into the gaps.
+    static constexpr vk::DeviceSize MaxGapForMerge = 64_KB;
     u32 batch_start = 0;
     u32 batch_end = 0;
 
@@ -56,19 +60,20 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         auto src_offset_max = copy.srcOffset + copy.size;
         auto dst_offset_min = copy.dstOffset;
         auto dst_offset_max = copy.dstOffset + copy.size;
+        vk::DeviceSize batch_bytes = copy.size;
 
         for (++batch_end; batch_end < copies.size(); batch_end++) {
             // Compute new src and dst bounds if we were to batch this copy
             const auto& [src_offset, dst_offset, size] = copies[batch_end];
             auto new_src_offset_min = std::min(src_offset_min, src_offset);
             auto new_src_offset_max = std::max(src_offset_max, src_offset + size);
-            if (new_src_offset_max - new_src_offset_min > MaxDistanceForMerge) {
+            if (new_src_offset_max - new_src_offset_min > batch_bytes + size + MaxGapForMerge) {
                 break;
             }
 
             auto new_dst_offset_min = std::min(dst_offset_min, dst_offset);
             auto new_dst_offset_max = std::max(dst_offset_max, dst_offset + size);
-            if (new_dst_offset_max - new_dst_offset_min > MaxDistanceForMerge) {
+            if (new_dst_offset_max - new_dst_offset_min > batch_bytes + size + MaxGapForMerge) {
                 break;
             }
 
@@ -77,6 +82,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             src_offset_max = new_src_offset_max;
             dst_offset_min = new_dst_offset_min;
             dst_offset_max = new_dst_offset_max;
+            batch_bytes += size;
         }
 
         // Obtain buffers for the total source and destination ranges.
