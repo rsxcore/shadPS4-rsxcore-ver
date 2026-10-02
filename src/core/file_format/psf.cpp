@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <ranges>
 
 #include "common/assert.h"
@@ -110,7 +111,12 @@ bool PSF::Open(const std::vector<u8>& psf_buffer) {
 }
 
 bool PSF::Encode(const std::filesystem::path& filepath) const {
-    Common::FS::IOFile file(filepath, Common::FS::FileAccessMode::Create);
+    // Write to a temporary file and swap it in, so a crash or a killed process while saving
+    // cannot leave an empty or truncated param.sfo behind (which breaks the whole save).
+    auto temp_path = filepath;
+    temp_path += ".tmp";
+
+    Common::FS::IOFile file(temp_path, Common::FS::FileAccessMode::Create);
     if (!file.IsOpen()) {
         return false;
     }
@@ -122,9 +128,22 @@ bool PSF::Encode(const std::filesystem::path& filepath) const {
     if (written != psf_buffer.size()) {
         LOG_ERROR(Core, "Failed to write PSF file. Written {} Expected {}", written,
                   psf_buffer.size());
+        file.Close();
+        std::error_code ec;
+        std::filesystem::remove(temp_path, ec);
+        return false;
     }
+    file.Flush();
     file.Close();
-    return written == psf_buffer.size();
+
+    std::error_code ec;
+    std::filesystem::rename(temp_path, filepath, ec);
+    if (ec) {
+        LOG_ERROR(Core, "Failed to replace PSF file {}: {}", filepath.string(), ec.message());
+        std::filesystem::remove(temp_path, ec);
+        return false;
+    }
+    return true;
 }
 
 std::vector<u8> PSF::Encode() const {
