@@ -1409,6 +1409,13 @@ if (NOT MSVC)
     target_compile_options(shadps4 PRIVATE -Wno-invalid-offsetof)
 endif()
 
+# Optimized build with debug symbols, for sampling profilers.
+option(SHADPS4_DEBUG_SYMBOLS "Generate debug symbols (PDB) for the emulator executable" OFF)
+if (SHADPS4_DEBUG_SYMBOLS AND MSVC)
+    target_compile_options(shadps4 PRIVATE /Z7)
+    target_link_options(shadps4 PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+endif()
+
 add_compile_definitions(BOOST_ASIO_STANDALONE)
 
 target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
