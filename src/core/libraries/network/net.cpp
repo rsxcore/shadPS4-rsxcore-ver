@@ -11,6 +11,9 @@
 #include <fcntl.h>
 #endif
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
 #include <core/libraries/kernel/kernel.h>
 #include <magic_enum/magic_enum.hpp>
 #include "common/assert.h"
@@ -1019,6 +1022,13 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
         result = epoll_wait(epoll->epoll_fd, native_events.data(), maxevents,
                             timeout < 0 ? timeout : timeout / 1000);
 #endif
+    } else if (timeout != 0 && epoll->async_resolutions.empty()) {
+        // Nothing to wait on, but the guest still expects the call to block for the timeout.
+        // Returning immediately turns its polling loop into a busy spin that burns a whole host
+        // core. Sleep in bounded slices so sockets added meanwhile are picked up next call.
+        constexpr int MaxIdleWaitUs = 16'000;
+        const int wait_us = timeout < 0 ? MaxIdleWaitUs : std::min(timeout, MaxIdleWaitUs);
+        std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
     }
 
     int i = 0;
