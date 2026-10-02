@@ -6,6 +6,7 @@
 #include <limits>
 #include <magic_enum/magic_enum.hpp>
 
+#include "common/slow_op.h"
 #include "common/alignment.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
@@ -380,6 +381,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    SLOW_OP_TIMER("BufferCache::EnsureResident");
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {

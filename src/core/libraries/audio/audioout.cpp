@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -531,6 +533,46 @@ s32 PS4_SYSV_ABI sceAudioOutGetPortState(s32 handle, OrbisAudioOutPortState* sta
     return ORBIS_OK;
 }
 
+// Accumulates the peak and RMS level of a submitted buffer and logs them every few seconds, so
+// silent ports (e.g. missing sound effects while music plays) can be spotted in the log.
+static void MeterOutputLevel(PortOut& port, s32 port_id, const void* data) {
+    const u64 count = u64(port.buffer_frames) * port.format_info.num_channels;
+    if (port.format_info.is_float && port.format_info.sample_size == sizeof(float)) {
+        const auto* samples = static_cast<const float*>(data);
+        for (u64 i = 0; i < count; ++i) {
+            const float s = samples[i];
+            port.level_peak = std::max(port.level_peak, std::abs(s));
+            port.level_sum_sq += double(s) * s;
+        }
+    } else if (!port.format_info.is_float && port.format_info.sample_size == sizeof(s16)) {
+        const auto* samples = static_cast<const s16*>(data);
+        for (u64 i = 0; i < count; ++i) {
+            const float s = samples[i] / 32768.0f;
+            port.level_peak = std::max(port.level_peak, std::abs(s));
+            port.level_sum_sq += double(s) * s;
+        }
+    } else {
+        return;
+    }
+    port.level_samples += count;
+
+    constexpr u64 LogIntervalUs = 5'000'000;
+    const u64 now = Kernel::sceKernelGetProcessTime();
+    if (port.level_window_start == 0) {
+        port.level_window_start = now;
+    }
+    if (now - port.level_window_start < LogIntervalUs) {
+        return;
+    }
+    const double rms = std::sqrt(port.level_sum_sq / std::max<u64>(port.level_samples, 1));
+    LOG_INFO(Lib_AudioOut, "Audio level port {} ({}): peak {:.4f}, rms {:.5f}", port_id,
+             magic_enum::enum_name(port.type), port.level_peak, rms);
+    port.level_peak = 0.0f;
+    port.level_sum_sq = 0.0;
+    port.level_samples = 0;
+    port.level_window_start = now;
+}
+
 s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
     LOG_TRACE(Lib_AudioOut, "(STUBBED) called, handle={:#x}, ptr={}", handle, fmt::ptr(ptr));
 
@@ -581,6 +623,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
 
         if (ptr != nullptr) {
             std::memcpy(port->output_buffer, ptr, port->BufferSize());
+            MeterOutputLevel(*port, port_id, ptr);
             port->output_ready = true;
             samples_sent = port->buffer_frames * port->format_info.num_channels;
         }
@@ -687,6 +730,7 @@ s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
     for (u32 i = 0; i < num; i++) {
         if (param[i].ptr != nullptr) {
             std::memcpy(ports[i]->output_buffer, param[i].ptr, ports[i]->BufferSize());
+            MeterOutputLevel(*ports[i], GetPortId(param[i].handle), param[i].ptr);
             ports[i]->output_ready = true;
         }
     }

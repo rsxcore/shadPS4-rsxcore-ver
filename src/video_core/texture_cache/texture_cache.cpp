@@ -3,6 +3,7 @@
 
 #include <xxhash.h>
 
+#include "common/slow_op.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -504,6 +505,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
+    SLOW_OP_TIMER("TextureCache::FindImage");
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
@@ -702,6 +704,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    SLOW_OP_TIMER("TextureCache::RefreshImage");
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }

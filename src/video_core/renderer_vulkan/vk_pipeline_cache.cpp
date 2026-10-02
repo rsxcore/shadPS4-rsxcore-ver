@@ -3,6 +3,7 @@
 
 #include <ranges>
 
+#include "common/slow_op.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -335,6 +336,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    SLOW_OP_TIMER("PipelineCache::GetGraphicsPipeline");
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         return nullptr;
@@ -365,6 +367,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    SLOW_OP_TIMER("PipelineCache::GetComputePipeline");
     if (!RefreshComputeKey()) {
         return nullptr;
     }

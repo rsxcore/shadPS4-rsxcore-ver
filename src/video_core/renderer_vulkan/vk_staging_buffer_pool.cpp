@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 
+#include "common/slow_op.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/types.h"
@@ -37,6 +38,7 @@ StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 alignment, bool deferred,
                                             bool unsynchronized) {
+    SLOW_OP_TIMER("StagingBufferPool::Request");
     Ring& ring = rings[u32(type)];
     if (deferred || size > BLOCK_SIZE) {
         return RequestLarge(size, type, deferred, unsynchronized);

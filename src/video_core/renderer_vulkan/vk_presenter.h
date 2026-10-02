@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 
 #include "core/libraries/videoout/buffer.h"
@@ -108,6 +109,8 @@ private:
 
     void SetExpectedGameSize(s32 width, s32 height);
 
+    void LogFramePacing();
+
 private:
     float expected_ratio{1920.0 / 1080.0f};
     u32 expected_frame_width{1920};
@@ -136,6 +139,16 @@ private:
     std::condition_variable_any frame_cv;
     std::optional<ImGui::RefCountedTexture> splash_img;
     std::vector<VAddr> vo_buffers_addr;
+
+    struct FramePacing {
+        std::chrono::steady_clock::time_point last_frame{};
+        std::chrono::steady_clock::time_point window_start{};
+        u32 frames{};
+        double total_ms{};
+        double max_ms{};
+        u32 over_40ms{};
+        u32 over_60ms{};
+    } pacing;
 };
 
 } // namespace Vulkan

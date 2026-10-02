@@ -824,6 +824,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/small_vector.h
            src/common/slot_vector.cpp
            src/common/slot_vector.h
+           src/common/slow_op.h
            src/common/spin_lock.cpp
            src/common/spin_lock.h
            src/common/stb.cpp

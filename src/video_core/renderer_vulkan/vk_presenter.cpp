@@ -1083,7 +1083,34 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        LogFramePacing();
     }
+}
+
+void Presenter::LogFramePacing() {
+    // Once a second, log how evenly game frames were presented. Long frames show up as stutter
+    // even when the average frame rate looks fine.
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    if (pacing.last_frame != Clock::time_point{}) {
+        const double ms = std::chrono::duration<double, std::milli>(now - pacing.last_frame).count();
+        ++pacing.frames;
+        pacing.total_ms += ms;
+        pacing.max_ms = std::max(pacing.max_ms, ms);
+        pacing.over_40ms += ms > 40.0;
+        pacing.over_60ms += ms > 60.0;
+    } else {
+        pacing.window_start = now;
+    }
+    pacing.last_frame = now;
+    if (now - pacing.window_start < std::chrono::seconds{1} || pacing.frames == 0) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Frame pacing: {} frames, avg {:.1f} ms, max {:.1f} ms, >40ms {}, >60ms {}",
+             pacing.frames, pacing.total_ms / pacing.frames, pacing.max_ms, pacing.over_40ms,
+             pacing.over_60ms);
+    pacing = {.last_frame = now, .window_start = now};
 }
 
 Frame* Presenter::GetRenderFrame() {

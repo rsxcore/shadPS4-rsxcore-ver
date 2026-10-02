@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/slow_op.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -117,6 +118,7 @@ void Scheduler::Flush() {
 }
 
 void Scheduler::Finish() {
+    SLOW_OP_TIMER("Scheduler::Finish");
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
@@ -125,6 +127,7 @@ void Scheduler::Finish() {
 }
 
 void Scheduler::Wait(u64 tick) {
+    SLOW_OP_TIMER("Scheduler::Wait");
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};

@@ -138,6 +138,12 @@ struct PortOut {
     bool is_restricted = false;
     bool is_mix_to_main = false;
 
+    // Output level metering, logged periodically to diagnose missing audio.
+    float level_peak = 0.0f;
+    double level_sum_sq = 0.0;
+    u64 level_samples = 0;
+    u64 level_window_start = 0;
+
     [[nodiscard]] u32 BufferSize() const {
         return buffer_frames * format_info.FrameSize();
     }
