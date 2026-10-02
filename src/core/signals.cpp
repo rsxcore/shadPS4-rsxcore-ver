@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <string>
 #include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
@@ -26,6 +28,51 @@ static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 namespace Core {
 
 #if defined(_WIN32)
+
+/// Logs registers and code-like return addresses found on the stack of an unhandled exception,
+/// so crashes in guest code can be traced back to the function that caused them.
+static void LogCrashContext(const EXCEPTION_POINTERS* pExp) noexcept {
+    if (pExp == nullptr || pExp->ContextRecord == nullptr) {
+        return;
+    }
+    const CONTEXT& c = *pExp->ContextRecord;
+    const auto* rec = pExp->ExceptionRecord;
+    if (rec != nullptr && rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        rec->NumberParameters >= 2) {
+        LOG_CRITICAL(Debug, "Access violation: {} address {:#x}",
+                     rec->ExceptionInformation[0] == 0   ? "read"
+                     : rec->ExceptionInformation[0] == 1 ? "write"
+                                                         : "execute",
+                     rec->ExceptionInformation[1]);
+    }
+    LOG_CRITICAL(Debug,
+                 "rip={:#x} rsp={:#x} rbp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} "
+                 "rsi={:#x} rdi={:#x}",
+                 c.Rip, c.Rsp, c.Rbp, c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi);
+    LOG_CRITICAL(Debug, "r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} "
+                        "r15={:#x}",
+                 c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15);
+
+    // Read the stack through ReadProcessMemory so a bad stack pointer cannot fault again here.
+    std::array<u64, 256> stack{};
+    SIZE_T read = 0;
+    ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(c.Rsp), stack.data(),
+                      sizeof(stack), &read);
+    std::string candidates;
+    for (size_t i = 0; i < read / sizeof(u64); ++i) {
+        const u64 value = stack[i];
+        MEMORY_BASIC_INFORMATION info{};
+        if (value < 0x10000 ||
+            VirtualQuery(reinterpret_cast<LPCVOID>(value), &info, sizeof(info)) == 0 ||
+            info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                             PAGE_EXECUTE_WRITECOPY)) == 0) {
+            continue;
+        }
+        candidates += fmt::format(" [rsp+{:#x}]={:#x}", i * sizeof(u64), value);
+    }
+    LOG_CRITICAL(Debug, "Executable addresses on stack:{}", candidates);
+}
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
@@ -142,6 +189,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        LogCrashContext(pExp);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 
