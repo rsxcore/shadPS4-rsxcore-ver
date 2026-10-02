@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
 #include <xxhash.h>
 
 #include "common/slow_op.h"
@@ -130,7 +131,12 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 }
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
-    std::scoped_lock lock{mutex};
+    std::unique_lock lock{mutex, std::defer_lock};
+    {
+        SLOW_OP_TIMER("InvalidateMemory: waiting for texture cache lock");
+        lock.lock();
+    }
+    SLOW_OP_TIMER("TextureCache::InvalidateMemory (locked)");
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
@@ -509,7 +515,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
-    std::scoped_lock lock{mutex};
+    std::unique_lock lock{mutex, std::defer_lock};
+    {
+        SLOW_OP_TIMER("FindImage: waiting for texture cache lock");
+        lock.lock();
+    }
     ImageIds image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
@@ -542,6 +552,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     int view_mip{-1};
     int view_slice{-1};
     if (!image_id) {
+        SLOW_OP_TIMER("FindImage: ResolveOverlap");
         for (const auto& cache_id : image_ids) {
             view_mip = -1;
             view_slice = -1;
@@ -571,13 +582,39 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
-        image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
-        RegisterImage(image_id);
+        // Creating the Vulkan image allocates device memory, which can take tens of
+        // milliseconds. Do it without holding the cache lock, so guest threads that fault on
+        // tracked pages (and wait for this lock in InvalidateMemory) are not stalled meanwhile.
+        lock.unlock();
+        std::optional<Image> new_image;
+        {
+            SLOW_OP_TIMER("FindImage: create image");
+            new_image.emplace(instance, runtime, slot_image_views, info);
+        }
+        {
+            SLOW_OP_TIMER("FindImage: waiting for texture cache lock");
+            lock.lock();
+        }
+        // Another thread may have created the same image while the lock was released.
+        ForEachImageInRegion(info.guest_address, info.guest_size, [&](ImageId id, Image& image) {
+            if (!image_id && image.info.guest_address == info.guest_address &&
+                image.info.guest_size == info.guest_size && image.info.size == info.size &&
+                image.info.type == info.type && image.info.pixel_format == info.pixel_format) {
+                image_id = id;
+            }
+        });
+        if (!image_id) {
+            image_id = slot_images.Insert(std::move(*new_image));
+            RegisterImage(image_id);
+        }
     }
 
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
-    TouchImage(image);
+    {
+        SLOW_OP_TIMER("FindImage: TouchImage");
+        TouchImage(image);
+    }
 
     // If the image requested is a subresource of the image from cache record its location.
     if (view_mip > 0) {

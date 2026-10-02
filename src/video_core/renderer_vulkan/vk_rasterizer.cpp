@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -1218,8 +1219,17 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    const auto t0 = std::chrono::steady_clock::now();
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
+    const auto t1 = std::chrono::steady_clock::now();
     texture_cache.InvalidateMemory(addr, size);
+    const auto t2 = std::chrono::steady_clock::now();
+    const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    if (ms(t2 - t0) > 15.0) {
+        LOG_WARNING(Render, "Slow operation: InvalidateMemory of {:#x} bytes took {:.1f} ms "
+                            "(buffers {:.1f} ms, textures {:.1f} ms)",
+                    size, ms(t2 - t0), ms(t1 - t0), ms(t2 - t1));
+    }
     return true;
 }
 
