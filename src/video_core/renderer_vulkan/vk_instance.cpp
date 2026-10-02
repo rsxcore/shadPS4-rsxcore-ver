@@ -376,10 +376,14 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // A second queue of the graphics family, when available, lets buffer readbacks of
+    // already completed GPU work run without flushing and waiting for the main queue.
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    const u32 queue_count =
+        std::min<u32>(family_properties[queue_family_index].queueCount, queue_priorities.size());
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = queue_count,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -589,6 +593,9 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (queue_count > 1) {
+        readback_queue = device->getQueue(queue_family_index, 1);
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

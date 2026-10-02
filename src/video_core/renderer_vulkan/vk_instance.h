@@ -75,6 +75,11 @@ public:
         return present_queue;
     }
 
+    /// Returns a secondary queue of the graphics family, or a null handle if unavailable.
+    vk::Queue GetReadbackQueue() const {
+        return readback_queue;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -503,6 +508,7 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue readback_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;

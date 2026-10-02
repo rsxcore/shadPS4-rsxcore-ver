@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <deque>
+#include <span>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -119,7 +122,12 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
+    std::pair<vk::DeviceMemory, u64> AllocateResidentMemory(u64 size);
+
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+
+    void CopyOnReadbackQueue(const Buffer* arena, const Buffer* dst,
+                             std::span<const vk::BufferCopy> copies, u64 wait_tick);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -138,10 +146,28 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    RangeMap<u64> gpu_write_ticks; ///< Scheduler tick of the last GPU write of each range.
+
+    vk::Queue readback_queue;
+    vk::UniqueCommandPool readback_pool;
+    vk::CommandBuffer readback_cmdbuf;
+    vk::UniqueFence readback_fence;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
     bool fault_process_pending{};
+
+    struct PerfStats {
+        std::atomic<u64> downloads{};
+        std::atomic<u64> download_bytes{};
+        std::atomic<u64> wait_us{};
+        std::atomic<u64> allocs{};
+        std::atomic<u64> alloc_us{};
+        std::atomic<u64> bind_calls{};
+        std::atomic<u64> bind_us{};
+        std::atomic<u64> fast_downloads{};
+        std::chrono::steady_clock::time_point last_report{};
+    } perf_stats;
 
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;
@@ -159,6 +185,9 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    vk::DeviceMemory residency_chunk{};
+    u64 residency_chunk_size{};
+    u64 residency_chunk_used{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};

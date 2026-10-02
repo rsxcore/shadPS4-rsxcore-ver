@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -23,6 +25,7 @@
 namespace VideoCore {
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
+static constexpr u64 RESIDENCY_CHUNK_SIZE = 64_MB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 
 static constexpr auto ARENA_USAGE =
@@ -30,6 +33,12 @@ static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
     vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
     vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+
+static u64 ElapsedUs(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                                 start)
+        .count();
+}
 
 std::optional<u32> FindMemoryType(const vk::PhysicalDeviceMemoryProperties& properties,
                                   vk::MemoryPropertyFlags wanted, u32 memory_type_bits) {
@@ -85,6 +94,24 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+
+    readback_queue = instance.GetReadbackQueue();
+    if (readback_queue && !std::getenv("SHADPS4_NO_FAST_READBACK")) {
+        const vk::CommandPoolCreateInfo pool_ci = {
+            .flags = vk::CommandPoolCreateFlagBits::eTransient |
+                     vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+        };
+        readback_pool = Vulkan::Check(device.createCommandPoolUnique(pool_ci));
+        const vk::CommandBufferAllocateInfo cmdbuf_ai = {
+            .commandPool = *readback_pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = 1,
+        };
+        readback_cmdbuf = Vulkan::Check(device.allocateCommandBuffers(cmdbuf_ai)).front();
+        readback_fence = Vulkan::Check(device.createFenceUnique({}));
+    }
+    LOG_INFO(Render_Vulkan, "Fast buffer readbacks: {}", readback_cmdbuf ? "enabled" : "disabled");
 }
 
 BufferCache::~BufferCache() = default;
@@ -93,6 +120,25 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - perf_stats.last_report < std::chrono::seconds{1}) {
+        return;
+    }
+    perf_stats.last_report = now;
+    const u64 downloads = perf_stats.downloads.exchange(0);
+    const u64 allocs = perf_stats.allocs.exchange(0);
+    const u64 bind_calls = perf_stats.bind_calls.exchange(0);
+    if (downloads == 0 && allocs == 0 && bind_calls == 0) {
+        return;
+    }
+    LOG_INFO(Render,
+             "Last second: readbacks {} ({} fast, {} KB, {} ms GPU wait), residency allocs {} "
+             "({} ms), sparse binds {} ({} ms)",
+             downloads, perf_stats.fast_downloads.exchange(0),
+             perf_stats.download_bytes.exchange(0) / 1_KB, perf_stats.wait_us.exchange(0) / 1000,
+             allocs, perf_stats.alloc_us.exchange(0) / 1000, bind_calls,
+             perf_stats.bind_us.exchange(0) / 1000);
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
@@ -130,6 +176,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
+    u64 last_write_tick = 0;
     const VAddr arena_base = arena->cpu_addr;
     memory_tracker->ForEachDownloadRange<false>(device_addr, size, [&](u64 address, u64 size) {
         const auto add_download = [&](VAddr start, VAddr end) {
@@ -147,16 +194,31 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         };
         gpu_modified_ranges.ForEachInRange(address, size, add_download);
         gpu_modified_ranges.Subtract(address, size);
+        gpu_write_ticks.ForEachInRange(address, size, [&](VAddr, VAddr, u64 tick) {
+            last_write_tick = std::max(last_write_tick, tick);
+        });
+        gpu_write_ticks.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
         return;
     }
+    const auto wait_start = std::chrono::steady_clock::now();
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
-    runtime.CopyBuffer(arena, download.buffer, copies);
-    scheduler.Finish();
+    if (readback_cmdbuf && last_write_tick < scheduler.CurrentTick()) {
+        // The data was produced by already submitted work, so there is no need to flush the
+        // command buffer being recorded and wait for the whole GPU queue to drain.
+        CopyOnReadbackQueue(arena, download.buffer, copies, last_write_tick);
+        ++perf_stats.fast_downloads;
+    } else {
+        runtime.CopyBuffer(arena, download.buffer, copies);
+        scheduler.Finish();
+    }
+    ++perf_stats.downloads;
+    perf_stats.download_bytes += total_size_bytes;
+    perf_stats.wait_us += ElapsedUs(wait_start);
 
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
@@ -165,6 +227,48 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
                                 copy.size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+}
+
+void BufferCache::CopyOnReadbackQueue(const Buffer* arena, const Buffer* dst,
+                                      std::span<const vk::BufferCopy> copies, u64 wait_tick) {
+    const vk::CommandBufferBeginInfo begin_info = {
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    };
+    Vulkan::Check(readback_cmdbuf.begin(begin_info));
+    readback_cmdbuf.copyBuffer(arena->Handle(), dst->Handle(), copies);
+    const vk::MemoryBarrier2 host_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    readback_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &host_barrier,
+    });
+    Vulkan::Check(readback_cmdbuf.end());
+
+    // Waiting on the tick of the last write orders the copy after it and makes its writes
+    // visible, without depending on anything submitted later.
+    const vk::Semaphore wait_semaphore = scheduler.GetWorkSemaphore()->Handle();
+    const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
+    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = 1,
+        .pWaitSemaphoreValues = &wait_tick,
+    };
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_si,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &wait_semaphore,
+        .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &readback_cmdbuf,
+    };
+    const auto submit_result = readback_queue.submit(submit_info, *readback_fence);
+    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during readback");
+    const auto device = instance.GetDevice();
+    Vulkan::Check(device.waitForFences(*readback_fence, true, std::numeric_limits<u64>::max()));
+    Vulkan::Check(device.resetFences(*readback_fence));
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
@@ -186,6 +290,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        gpu_write_ticks.Subtract(device_addr, size);
+        gpu_write_ticks.Add(device_addr, size, scheduler.CurrentTick());
     }
     return {arena, arena->Offset(device_addr)};
 }
@@ -285,21 +391,16 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         return;
     }
 
-    const vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
-
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
 
-    u64 memory_offset{};
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
     for (const auto& range : bind_ranges) {
+        const auto [device_memory, memory_offset] =
+            AllocateResidentMemory((range.end - range.start) << block_shift);
         Backing backing;
         backing.start = range.start;
         backing.end = range.end;
@@ -315,7 +416,6 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
             .memory = device_memory,
             .memoryOffset = memory_offset,
         });
-        memory_offset += bind.size;
 
         for (u32 block = 0; block < bind.size; block += block_size) {
             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
@@ -327,6 +427,27 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
     staging.Flush();
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
+}
+
+std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidentMemory(u64 size) {
+    // Sparse residency is requested in small block runs. Allocating each run separately is
+    // slow and exhausts the driver allocation limit, so runs are carved out of large chunks.
+    // Resident memory is never released, so a bump allocator is sufficient.
+    if (!residency_chunk || residency_chunk_used + size > residency_chunk_size) {
+        const auto alloc_start = std::chrono::steady_clock::now();
+        residency_chunk_size = std::max(RESIDENCY_CHUNK_SIZE, size);
+        const vk::MemoryAllocateInfo alloc_info = {
+            .allocationSize = residency_chunk_size,
+            .memoryTypeIndex = arena_memory_type_index,
+        };
+        residency_chunk = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+        residency_chunk_used = 0;
+        ++perf_stats.allocs;
+        perf_stats.alloc_us += ElapsedUs(alloc_start);
+    }
+    const u64 offset = residency_chunk_used;
+    residency_chunk_used += size;
+    return {residency_chunk, offset};
 }
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
@@ -436,7 +557,10 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     };
 
     info.AddWait(signal_sema, signal_tick);
+    const auto bind_start = std::chrono::steady_clock::now();
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+    ++perf_stats.bind_calls;
+    perf_stats.bind_us += ElapsedUs(bind_start);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     pending_binds.clear();
