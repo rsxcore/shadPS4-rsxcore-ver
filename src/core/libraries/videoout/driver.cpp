@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -341,9 +344,19 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                                                  EmulatorSettings.GetVblankFrequency());
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
+    // Every frame waits on this thread; keep background guest threads from preempting it.
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     Common::SetCurrentThreadRealtime(vblank_period);
 
     Common::AccurateTimer timer{vblank_period};
+
+    // Vblank timing stats, logged once a second: late vblanks make frames miss their slot.
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point last_vblank{};
+    Clock::time_point stats_start = Clock::now();
+    double max_interval_ms = 0.0;
+    double max_flip_ms = 0.0;
+    u32 late_vblanks = 0;
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -377,7 +390,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
+                const auto flip_start = Clock::now();
                 Flip(request);
+                max_flip_ms = std::max(
+                    max_flip_ms,
+                    std::chrono::duration<double, std::milli>(Clock::now() - flip_start).count());
                 FRAME_END;
             }
         }
@@ -404,6 +421,23 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();
+        }
+
+        const auto now = Clock::now();
+        if (last_vblank != Clock::time_point{}) {
+            const double interval_ms =
+                std::chrono::duration<double, std::milli>(now - last_vblank).count();
+            max_interval_ms = std::max(max_interval_ms, interval_ms);
+            const double period_ms = std::chrono::duration<double, std::milli>(vblank_period).count();
+            late_vblanks += interval_ms > period_ms * 1.5;
+        }
+        last_vblank = now;
+        if (now - stats_start >= std::chrono::seconds{1}) {
+            LOG_INFO(Lib_VideoOut, "VBlank: max interval {:.1f} ms, late {}, max flip {:.1f} ms",
+                     max_interval_ms, late_vblanks, max_flip_ms);
+            stats_start = now;
+            max_interval_ms = max_flip_ms = 0.0;
+            late_vblanks = 0;
         }
 
         timer.End();

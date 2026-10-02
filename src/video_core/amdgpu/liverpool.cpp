@@ -91,6 +91,8 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    // Every frame waits on this thread; keep background guest threads from preempting it.
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();
