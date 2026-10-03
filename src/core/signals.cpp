@@ -7,6 +7,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/path_util.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
@@ -16,6 +17,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+// clang-format off
+#include <dbghelp.h>
+// clang-format on
 static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 #else
 #include <csignal>
@@ -29,9 +33,49 @@ namespace Core {
 
 #if defined(_WIN32)
 
+/// Writes a minidump (with thread and memory info, but not the whole address space) next to the
+/// log, so a crash can be inspected in a debugger later.
+static void WriteCrashDump(EXCEPTION_POINTERS* pExp) noexcept {
+    using MiniDumpWriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+                                              PMINIDUMP_EXCEPTION_INFORMATION,
+                                              PMINIDUMP_USER_STREAM_INFORMATION,
+                                              PMINIDUMP_CALLBACK_INFORMATION);
+    const HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
+    if (dbghelp == nullptr) {
+        return;
+    }
+    const auto write_dump =
+        reinterpret_cast<MiniDumpWriteDumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+    if (write_dump == nullptr) {
+        return;
+    }
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                      fmt::format("crash_{:04}{:02}{:02}_{:02}{:02}{:02}.dmp", time.wYear,
+                                  time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    MINIDUMP_EXCEPTION_INFORMATION info{
+        .ThreadId = GetCurrentThreadId(),
+        .ExceptionPointers = pExp,
+        .ClientPointers = FALSE,
+    };
+    const auto type = static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo |
+                                                 MiniDumpWithIndirectlyReferencedMemory |
+                                                 MiniDumpWithDataSegs);
+    const bool ok = write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, type, &info,
+                               nullptr, nullptr);
+    CloseHandle(file);
+    LOG_CRITICAL(Debug, "Crash dump {}: {}", ok ? "written to" : "failed", path.string());
+}
+
 /// Logs registers and code-like return addresses found on the stack of an unhandled exception,
 /// so crashes in guest code can be traced back to the function that caused them.
-static void LogCrashContext(const EXCEPTION_POINTERS* pExp) noexcept {
+static void LogCrashContext(EXCEPTION_POINTERS* pExp) noexcept {
     if (pExp == nullptr || pExp->ContextRecord == nullptr) {
         return;
     }
@@ -72,6 +116,7 @@ static void LogCrashContext(const EXCEPTION_POINTERS* pExp) noexcept {
         candidates += fmt::format(" [rsp+{:#x}]={:#x}", i * sizeof(u64), value);
     }
     LOG_CRITICAL(Debug, "Executable addresses on stack:{}", candidates);
+    WriteCrashDump(pExp);
 }
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {

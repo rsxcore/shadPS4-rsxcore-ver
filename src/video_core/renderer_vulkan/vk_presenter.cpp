@@ -1099,6 +1099,10 @@ void Presenter::LogFramePacing() {
         pacing.max_ms = std::max(pacing.max_ms, ms);
         pacing.over_40ms += ms > 40.0;
         pacing.over_60ms += ms > 60.0;
+        if (ms > 50.0) {
+            LOG_WARNING(Render_Vulkan, "Hitch: game frame {} took {:.1f} ms",
+                        DebugState.GetFrameNum(), ms);
+        }
     } else {
         pacing.window_start = now;
     }

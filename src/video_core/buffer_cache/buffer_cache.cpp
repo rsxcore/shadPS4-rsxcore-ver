@@ -23,6 +23,11 @@
 
 #include <vk_mem_alloc.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 namespace VideoCore {
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
@@ -123,6 +128,10 @@ void BufferCache::TickFrame() {
     }
 
     const auto now = std::chrono::steady_clock::now();
+    if (now - last_status_report >= std::chrono::seconds{10}) {
+        last_status_report = now;
+        LogStatus();
+    }
     if (now - perf_stats.last_report < std::chrono::seconds{1}) {
         return;
     }
@@ -140,6 +149,22 @@ void BufferCache::TickFrame() {
              perf_stats.download_bytes.exchange(0) / 1_KB, perf_stats.wait_us.exchange(0) / 1000,
              allocs, perf_stats.alloc_us.exchange(0) / 1000, bind_calls,
              perf_stats.bind_us.exchange(0) / 1000);
+}
+
+void BufferCache::LogStatus() const {
+    // Periodic memory snapshot, to spot leaks and memory pressure behind slowdowns over time.
+    u64 process_mb = 0;
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+        process_mb = counters.WorkingSetSize / 1_MB;
+    }
+#endif
+    const u64 vram_mb = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() / 1_MB : 0;
+    LOG_INFO(Render, "Status: VRAM used {} MB of {} MB budget, sparse buffer memory {} MB, "
+                     "process RAM {} MB",
+             vram_mb, instance.GetTotalMemoryBudget() / 1_MB, total_resident_bytes / 1_MB,
+             process_mb);
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
@@ -444,6 +469,7 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidentMemory(u64 size) {
         };
         residency_chunk = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
         residency_chunk_used = 0;
+        total_resident_bytes += residency_chunk_size;
         ++perf_stats.allocs;
         perf_stats.alloc_us += ElapsedUs(alloc_start);
     }

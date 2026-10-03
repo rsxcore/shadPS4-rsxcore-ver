@@ -78,6 +78,9 @@ public:
 
     void TickFrame();
 
+    /// Logs device and process memory usage.
+    void LogStatus() const;
+
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
@@ -188,6 +191,8 @@ private:
     vk::DeviceMemory residency_chunk{};
     u64 residency_chunk_size{};
     u64 residency_chunk_used{};
+    u64 total_resident_bytes{};
+    std::chrono::steady_clock::time_point last_status_report{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};
